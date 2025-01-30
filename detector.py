@@ -6,70 +6,82 @@ from datetime import datetime, timedelta
 import os
 
 
-# This function reads the log file and keeps track of failed login attempts
+# This function reads the log file and keeps track of failed and successful login attempts
 def read_log_file(file_path):
     failed_logins = []
+    successful_logins = []
+
     with open(file_path, 'r') as file:
         reader = csv.DictReader(file)
         for row in reader:
             try:
-                # Try to convert the time format and store the failed login attempt details
-                failed_logins.append({
-                    'ip': row['IP'],
-                    'time': datetime.strptime(row['Time'], '%d/%m/%Y %H:%M'),
-                    # This matches your log format (DD/MM/YYYY HH:MM)
-                    'request': row['Request'],
-                    'status code': row['Status Code'],
-                })
+                log_time = datetime.strptime(row['Time'], '%d/%m/%Y %H:%M')
+                status_code = row['Status Code']
+                ip = row['IP']
+
+                if status_code in ('200', '201'):
+                    successful_logins.append({'ip': ip, 'time': log_time})
+                else:
+                    failed_logins.append({'ip': ip, 'time': log_time})
             except ValueError as e:
-                # If the date format doesn't match, we'll skip that row and print a message
                 print(f"Skipping line due to invalid date format: {row['Time']} -> {e}")
-    return failed_logins
+
+    return failed_logins, successful_logins
 
 
 # This function organizes the failed login attempts by IP address
 def track_failed_attempts(failed_logins):
-    failed_attempt = defaultdict(list)
+    failed_attempts = defaultdict(list)
     for log in failed_logins:
-        ip = log['ip']
-        failed_attempt[ip].append(log['time'])  # For each IP, we append the time of the failed login
-    return failed_attempt
+        failed_attempts[log['ip']].append(log['time'])
+    return failed_attempts
 
 
-# This function looks for patterns that could indicate a brute force attack (multiple attempts in a short time frame)
+# This function detects brute force attacks based on login attempts in a short time frame
 def detect_brute_force(failed_attempts):
-    brute_force_ips = set()
+    brute_force_ips = {}
+
     for ip, attempts in failed_attempts.items():
-        attempts.sort()  # We sort the login attempts for this IP by time
-        # We check if there are 3 or more failed logins within 5 minutes
+        attempts.sort()
         for i in range(len(attempts) - 2):
             window = [attempts[j] for j in range(i, i + 3)]
-            if (window[-1] - window[0]).total_seconds() <= 300:  # If the time difference is 5 minutes or less
-                brute_force_ips.add(ip)  # This IP is a potential brute force attacker
+            if (window[-1] - window[0]).total_seconds() <= 300:
+                brute_force_ips[ip] = {'start': window[0], 'end': window[-1]}
                 break
+
     return brute_force_ips
 
 
-# This function generates a CSV report of any detected brute force activity
-def generate_report(failed_attempts, brute_force_ips):
-    # We'll save the results into a CSV file
+# This function checks if a successful login occurred after the brute-force window
+def check_successful_logins(successful_logins, brute_force_ips):
+    success_dict = {ip: "No" for ip in brute_force_ips}
+
+    for success in successful_logins:
+        ip = success['ip']
+        success_time = success['time']
+
+        if ip in brute_force_ips and success_time >= brute_force_ips[ip]['end']:
+            success_dict[ip] = "Yes"
+
+    return success_dict
+
+
+# This function generates a CSV report
+def generate_report(failed_attempts, brute_force_ips, success_dict):
     with open('suspicious_activity.csv', 'w', newline='') as csvfile:
-        fieldnames = ['IP', 'Start', 'End', 'Attempts']
+        fieldnames = ['IP', 'Start', 'End', 'Attempts', 'Success: Yes/No']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()  # Write the column headers
+        writer.writeheader()
 
-        # Go through each failed attempt and add it to the report if it's related to brute force
-        for ip, attempts in failed_attempts.items():
-            if ip in brute_force_ips:
-                attempts.sort()  # Sort the attempts by time
-                writer.writerow({
-                    'IP': ip,
-                    'Start': attempts[0].strftime('%d/%m/%Y %H:%M'),  # Start time of brute force attempts
-                    'End': attempts[-1].strftime('%d/%m/%Y %H:%M'),  # End time of brute force attempts
-                    'Attempts': len(attempts),  # Number of failed attempts
-                })
+        for ip, details in brute_force_ips.items():
+            writer.writerow({
+                'IP': ip,
+                'Start': details['start'].strftime('%d/%m/%Y %H:%M'),
+                'End': details['end'].strftime('%d/%m/%Y %H:%M'),
+                'Attempts': len(failed_attempts[ip]),
+                'Success: Yes/No': success_dict[ip]
+            })
 
-    # Show a warning if brute force was detected, or let the user know if no attack was found
     if brute_force_ips:
         messagebox.showwarning("Brute Force Attack Detected",
                                "Warning: Potential Brute Force Attack detected! A report has been generated.")
@@ -77,40 +89,33 @@ def generate_report(failed_attempts, brute_force_ips):
         messagebox.showinfo("No Brute Force Detected", "No brute force attacks detected.")
 
 
-# This function is the heart of the UI interaction
+# This function is triggered when the user selects a file
 def start_process():
-    # Ask the user to select a CSV file using a file dialog
     file_path = filedialog.askopenfilename(title="Select Log File", filetypes=[("CSV Files", "*.csv")])
 
     if not file_path:
-        # If no file is selected, show a warning
         messagebox.showwarning("File Not Selected", "Please select a valid CSV file.")
         return
 
-    # Try to process the selected file
     try:
-        # Read the log file, track failed login attempts, detect brute force, and generate the report
-        failed_logins = read_log_file(file_path)
+        failed_logins, successful_logins = read_log_file(file_path)
         failed_attempts = track_failed_attempts(failed_logins)
         brute_force_ips = detect_brute_force(failed_attempts)
-        generate_report(failed_attempts, brute_force_ips)
+        success_dict = check_successful_logins(successful_logins, brute_force_ips)
+        generate_report(failed_attempts, brute_force_ips, success_dict)
     except Exception as e:
-        # If something goes wrong, show an error message
         messagebox.showerror("Error", f"An error occurred: {e}")
 
 
-# Set up the main window for the app using Tkinter
+# Set up the Tkinter GUI
 root = tk.Tk()
-root.title("Brute Force Detection Tool")  # Give the window a title
-root.geometry("400x200")  # Set the size of the window
+root.title("Brute Force Detection Tool")
+root.geometry("400x200")
 
-# Create and display the label on the window
 label = tk.Label(root, text="Select a log file to analyze for brute force attacks.", padx=10, pady=10)
 label.pack()
 
-# Create and display the button that starts the process when clicked
 process_button = tk.Button(root, text="Process Log File", command=start_process, padx=20, pady=10)
 process_button.pack()
 
-# Start the Tkinter event loop to run the app
 root.mainloop()
